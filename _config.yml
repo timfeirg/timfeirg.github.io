@@ -4,12 +4,14 @@ meta_description: ""
 
 markdown: kramdown
 highlighter: rouge
-logo: false
+logo: /assets/images/me.ico
 paginate: 15
 baseurl: ""
 domain_name: "http://timfeirg.github.io"
 google_analytics: "UA-112067081-1"
-plugins: [jekyll-paginate]
+plugins:
+  - jekyll-paginate
+  - jekyll-image-size
 
 # Details for the RSS feed generator
 url: ""
