@@ -1,0 +1,141 @@
+---
+layout: post
+title:  "小团队如何维护 GitLab"
+date:   2022-02-22 00:00:00
+---
+
+这是一份放置于公开空间的项目文档, 记录我如何维护 GitLab.
+
+## 安装与配置
+
+[官方的 Helm Chart](https://docs.gitlab.com/charts/) 维护的非常好, 文档也十分详尽, 因此在这里只补充一些要点:
+
+* 把 Helm Chart 拉下来以后, 做成一个单独的代码仓库(而不是塞到某一个 Ansible 仓库里, 或者和各种其他应用的 Helm Chart 放一起管理), 原因在下一节中介绍
+* GitLab 所依赖的各种 Subcharts, 比方说 Redis, PostgreSQL, Nginx (Ingress Controller), 一般来说最好都禁用掉, 改用专门的 Helm Chart 来维护. 这些都是特别受欢迎的基础设施, 其他应用也往往要一起共用的, 单独维护比作为 Subchart 要更灵活
+* 劝你禁用 gitlab-shell, 这样一来, 效果上就是只允许 git clone via https, 不开放 ssh. 为啥? 因为 ssh 的流量入口做起来比较麻烦(需要在内网负载均衡专门维护一个 22/TCP), 并且还引入 pubkey, 用户不一定能管理好, SA 要尽可能消灭需要技术支持的地方
+* 如果你真的是小团队, 并且 Git Repo 一样很小, 那么可以考虑把数据落到 [JuiceFS](https://www.juicefs.com/), 在数据安全性方面能省很多事情. 性能确实没法跟 SSD 相比, git push 以及 MR 相关的操作都会稍慢一些
+* 安装 Helm Chart 的时候, 需要手动创建各种 Kubernetes Secret, 你一定懒得自己写 yaml, 然后调用 kubectl 来手动创建吧, 如果你也在用 [lain](https://github.com/timfeirg/lain-cli) 的话, 就可以用类似 `lain secret edit gitlab-postgres` 的命令, 来直接以明文编辑 Kubernetes Secret 啦
+* GitLab 的镜像在国内未必能顺利拉取, 如果你需要搬运镜像到私有空间, `lain push --pull [IMAGE]` 这个命令也能帮到你, 详见下方的代码片段
+* 初始用户的密码虽然可以用 `initialRootPassword` 来配置, 但我懒得再维护一个 Secret 了, 因此我选择在 rails console 里直接交互式重置 root 密码, 详见下方的代码片段
+
+安装过程就不手把手教你了, 在这里放一些途中会用到的常用命令:
+
+```bash
+# 查看容器状态
+watch 'kubectl -n default get pod -owide -lrelease=gitlab'
+watch 'kubectl -n default top pod -lrelease=gitlab'
+# 重置 root 密码, 首先钻进容器里
+k exec -it $(kubectl get pod -l app=webservice -o custom-columns=":metadata.name") -- /srv/gitlab/bin/rails dbconsole
+# 进入 irb 以后, 用以下命令修改 root 密码
+> u = User.where(id: 1).first
+=> #<User id:1 @root>
+> u.update_with_password(password: "foo")
+> u.save!
+# 在 irb 里可以做这样一个调用, 来发送测试邮件
+Notify.test_email('timfeirg@beiye.ai', 'Message Subject', 'Message Body').deliver_now
+```
+
+如果你需要搬运镜像, 可以用 `helm template . | ag image` 这个命令来找出所有需要用到的镜像, 然后批量来做搬运, 比如我用 lain 做了这样一个脚本:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+
+export VERSION=v14.7.3
+export LAIN_REMOTE_DOCKER=true
+lain use dev
+
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/gitaly:$VERSION
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/gitlab-sidekiq-ce:$VERSION
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/gitlab-toolbox-ce:$VERSION
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/gitlab-workhorse-ce:$VERSION
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/gitlab-webservice-ce:$VERSION
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/gitlab-pages:v1.48.0
+
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/gitlab-container-registry:v3.9.0-gitlab
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/gitlab-exporter:11.2.0
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/gitlab-shell:v13.19.1
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/kubectl:1.16.15
+lain push --pull registry.gitlab.com/gitlab-org/cloud-native/mirror/images/busybox:latest
+# https://hub.docker.com/r/gitlab/gitlab-runner/tags?page=1&ordering=last_updated
+lain push --pull gitlab/gitlab-runner:latest
+lain push --pull gitlab/gitlab-runner-helper:ubuntu-x86_64-bleeding
+lain push --pull registry.gitlab.com/gitlab-org/build/cng/alpine-certificates:20191127-r2
+```
+
+## 持续更新和升级
+
+GitLab 永远没有 bug-free 的状态, 所以[持续升级](https://gitlab.com/gitlab-org/gitlab/-/releases)是很必要的. 同时要注意, 最好等到一两个 patch 发布以后, 再予以更新. 比方说 14.5.0 发布了, 不妨等到 14.5.1-14.5.3 再开始测试升级. 小团队杂事多, 尽量选择最稳妥的行事方式, 节省人力.
+
+我习惯用 rebase 工作流来升级 Helm Chart, 事实上 merge 工作流是更适于协作的, 但在维护基础设施的事情上, 很少需要协作参与, 因此就按照 rebase 的模式来介绍吧:
+
+```bash
+# upgrade 分支不包含任何定制部分, 仅用于追踪最新版的 gitlab helm chart
+git checkout upgrade
+# 清空所有文件, 为接下来的覆盖做准备
+rm -rf *
+# 更新 helm chart, 直接覆盖我们当前的 chart
+helm repo update
+helm fetch --untar gitlab/gitlab
+cp -r gitlab/* . && rm -rf gitlab/
+# 提交到 upgrade 分支
+git add --all
+git commit -m 'upgrade helm chart to xxx'
+# 切换回 master, 用 rebase 的方式获取最新进展, 解决掉途中的冲突
+git checkout master
+git rebase upgrade
+# 最后别忘了把两个分支都 push 上去
+git push origin master
+git push origin upgrade
+```
+
+上边流程里用的是 master 分支, 但其实, 更地道的方式是做一个与 master 一样的 dev 分支, 测通以后再将其转化为 master 分支, 避免升级过程拖太久, 造成生产环境维护不便. 总而言之, 现在 Helm Chart 代码仓库已经升级完毕, 可以进行新版 GitLab 的测试了.
+
+测试新版 GitLab, 无非就是看看网页能否正常打开并登陆, 然后验证 git push / pull 能顺利执行. 剩下的就相信 GitLab 团队吧, 这么成熟的项目, 不会出什么大问题的. 不过即使是验证基础功能, 我也不想每次升级都手动做一次 git push, 因此用 gitlab-ci 实现了 E2E 测试:
+
+```yaml
+variables:
+  GIT_URL: https://git.example.com
+  GIT_TRACE: "true"
+  GIT_CURL_VERBOSE: "true"
+  GIT_TRACE: "true"
+
+stages:
+  - deploy
+  - test
+  - clean
+
+deploy_job:
+  stage: deploy
+  script:
+    - lain use dev
+    - kubectl scale --replicas=1 sts -n default pg-postgresql
+    - helm upgrade --install gitlab . -f values-dev.yaml
+    - timeout 300 bash -c 'while [[ "$(curl -s -o /dev/null -w ''%{http_code}'' $GIT_URL)" != "302" ]]; do sleep 5; done' || false
+
+test_job:
+  stage: test
+  script:
+    - git checkout -b beiye || true
+    - git checkout beiye || true
+    - git remote add test $GIT_URL/dev/dummy || true
+    - git remote set-url test $GIT_URL/dev/dummy || true
+    - date > date.txt
+    - git add date.txt
+    - git commit --no-edit -m 'test commit'
+    - git log
+    - git push -v -f test beiye
+
+clean_job:
+  stage: clean
+  rules:
+    - when: manual
+  script:
+    - lain use dev
+    - helm delete gitlab
+    - kubectl scale --replicas=0 sts -n default pg-postgresql
+```
+
+这样一个流程能跑出绿灯, 就说明新版 GitLab 的基本功能应该没毛病, 可以比较有信心地执行升级了. 具体执行升级都是 helm 操作, 此处不赘述.
