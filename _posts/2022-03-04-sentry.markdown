@@ -1,0 +1,209 @@
+---
+layout: post
+title:  "小团队如何维护 sentry"
+date:   2022-03-04 00:00:00
+---
+
+之前写过一篇 [小团队如何维护 GitLab](https://timfeirg.github.io/2022/02/22/gitlab.html), 这篇文章也是类似的定位, 介绍这些年来在小公司折腾各种常见基础设施的心得和开发思路.
+
+## 安装与配置
+
+Sentry Helm Chart 的维护与 GitLab 类似, 可以参考之前的文章内容. 虽说有了 Helm Chart, 安装还是有一些工作量的, Sentry 这玩意已经成长为一个巨无霸了, 并且依赖的组件里不少都是多方共用(Redis, Kafka, RabbitMQ, ClickHouse), 最好一一拆散, 单独维护管理.
+
+### 安装依赖: ClickHouse
+
+我们目前在用 [clickhouse-operator](https://github.com/Altinity/clickhouse-operator), 成熟度和易用性都比 [Sentry 内置的 Subchart](https://github.com/sentry-kubernetes/charts/tree/develop/clickhouse) 更好, 推荐使用. 但之所以这样安排, 也是因为我们团队业务本身就需要用 CH. 如果你的团队只有 Sentry 需要 CH, 并且将来也不大可能出现基于 CH 的业务, 那确实没必要专门折腾 operator, 用 Subchart 简简单单做个单实例 CH 当然也是没问题的.
+
+以 clickhouse-operator 为例, 我们是这样搭建 CH 集群的:
+
+```yaml
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseInstallation"
+metadata:
+  name: "clickhouse"
+spec:
+  defaults:
+    templates:
+      podTemplate: clickhouse-with-volume-template
+      dataVolumeClaimTemplate: default-volume-claim
+      serviceTemplate: chi-service-template
+      replicaServiceTemplate: chi-service-template
+
+  configuration:
+    clusters:
+      - name: "clickhouse"
+        layout:
+          shardsCount: 3
+          replicasCount: 1
+    users:
+      default/networks/ip:
+        - "::/0"
+        - "0.0.0.0/0"
+    zookeeper:
+      nodes:
+        - host: zookeeper-0.zookeeper-headless
+          port: 2181
+        - host: zookeeper-1.zookeeper-headless
+          port: 2181
+        - host: zookeeper-2.zookeeper-headless
+          port: 2181
+  templates:
+    podTemplates:
+      - name: clickhouse-with-volume-template
+        spec:
+          containers:
+            - name: clickhouse-pod
+              image: yandex/clickhouse-server:20
+              resources:
+                requests:
+                  memory: 700Mi
+                  cpu: 600m
+                limits:
+                  memory: 4Gi
+                  cpu: 2
+              volumeMounts:
+                - name: clickhouse-storage-template
+                  mountPath: /var/lib/clickhouse
+              # 仅用于调试
+              # command:
+              #   - "/bin/bash"
+              #   - "-c"
+              #   - "while true; do sleep 600; done"
+    serviceTemplates:
+      - name: chi-service-template
+        spec:
+          ports:
+            - name: http
+              port: 8123
+            - name: tcp
+              port: 9000
+            - name: interserver
+              port: 9009
+          type: ClusterIP
+    volumeClaimTemplates:
+      - name: clickhouse-storage-template
+        spec:
+          storageClassName: juicefs-sc
+          persistentVolumeReclaimPolicy: Retain
+          accessModes:
+            - ReadWriteMany
+          resources:
+            requests:
+              storage: 100Gi
+```
+
+无论你用什么办法搭建 CH 集群, 请注意以下几点:
+
+* CH 时区必须设置为 UTC, [之前用过的一款 Helm Chart 将做成了东八区](https://github.com/liwenhe1993/charts/blob/master/clickhouse/values.yaml#L2), 会引发报错
+* (在本文写作时), [Sentry 尚不支持 ClickHouse 21](https://forum.sentry.io/t/support-for-clickhouse-21-x/13341/7), 因此建议保持 20
+* ClickHouse 推荐用 JuiceFS 来做持久化, 比较省事. 官方也专门[写文章介绍过](https://juicefs.com/blog/cn/posts/clickhouse-disaggregated-storage-and-compute-practice/)
+
+### 安装依赖: Redis, Rabbitmq, Kafka, ZooKeeper, PostGreSQL
+
+这一堆东西都是自古以来开源社区的常用组件, 用 Helm Chart 各自安装都非常简单, 因此在这里总结以下要点:
+
+* 尽量用 RabbitMQ, 而不是 Redis, 作为 Sentry 的消息队列. 如果你的业务够牛逼, 那么 Sentry 的消息量将会非常大, 而 Redis 分配的资源往往不是很多, 如果设置不当的话, 很容易出现压垮或者丢数据的事故. 如果有什么难言之隐非要 Redis, 那建议你设置好 `maxmemory-policy volatile-lru`, 起码不至于挤掉持久化的数据, 或者直接 OOM 宕机
+* PostGreSQL 要设置好 `autovacuum=on`, 不过社区的 Helm Chart 应该默认都配置好了. 如果没有这个选项的话, Sentry 很容易将 pg 磁盘打爆
+
+### 安装 Sentry
+
+安装 Helm Chart 没啥好说的, 我会额外注意这几点:
+
+* 最好提前设置出比较激进的清理策略 (`sentry.cleanup.days`), 比如我们团队只保留 14 天的数据, 否则报错量太大, pg 的磁盘占用可能会吃不消
+* 一定要给所有组件设置好资源边界 (也就是 `resources.limits`), 万一业务疯狂报错, Sentry 的各组件也会有不同程度的资源疯长. 我们决不能允许 Sentry 伴随着生产事故一起雪崩
+
+## 升级与测试
+
+个人感觉 Sentry 的开源版本维护的并不好, 升级带来的大小问题比较频繁, 这方面肯定和 GitLab 没法比了. 不过我可万万没有责备和不满的意思, 有这么优秀的开源软件可以用, 已经很感激涕零了. 不过现状既然如此, 就要格外注重升级测试.
+
+升级 Helm Chart 的流程与 GitLab 类似, 在这里仅介绍我如何做自动化的 E2E 测试, 一样使用 gitlab-ci 做的:
+
+```yaml
+variables:
+  URL: https://sentry.example.com
+  SENTRY_VERSION: 21.9.0
+  REPO: registry.example.com/sentry
+
+stages:
+  - build
+  - deploy
+  - test
+  - clean
+
+build_sentry:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "schedule"'
+  stage: build
+  script:
+    # 我们团队对 sentry 做了定制化, 启用了 sso 登录, 需要在 sentry 镜像基础上安装一些内部包
+    - bash -c "docker pull ${REPO}:${SENTRY_VERSION} || docker build --pull --squash --build-arg SENTRY_VERSION=${SENTRY_VERSION} -t ${REPO}:${SENTRY_VERSION} -f Dockerfile ."
+    - docker push ${REPO}:${SENTRY_VERSION}
+
+deploy_job:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "schedule"'
+  stage: deploy
+  script:
+    - lain use dev
+    # 平日为了节约资源, 这些组件都处于下线状态, 用到了再由 ci 临时上线
+    - kubectl scale --replicas=1 sts -n default pg-postgresql rabbitmq
+    - helm upgrade --install sentry . -f values-dev.yaml
+    - timeout 300 bash -c 'while [[ "$(curl -s -o /dev/null -w ''%{http_code}'' $URL)" != "302" ]]; do sleep 5; done' || false
+
+test_job:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "schedule"'
+  stage: test
+  script:
+    # 用来测试发消息流程的脚本, 在下方补充
+    - python ./send-event.py https://xxx@sentry.example.com/1
+
+clean_job:
+  stage: clean
+  # 测试过程不光是 CI 里跑通 E2E, 可能还需要人手动验证, 因此手动控制测试结束的资源释放
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "schedule"'
+      when: manual
+  script:
+    - ./uninstall.sh
+```
+
+可以看出, 升级测试的流程就是:
+
+* (可选)构建镜像
+* 部署, 等待服务绿灯
+* 用 Python 脚本发送消息, 人肉盯梢看报警消息有没有发到工作 IM, 这是最重要的一个环节, 如果消息能收到, 就代表 Sentry 的主要功能没毛病, 可以比较放心地上线了
+* (可选)手动进行一些其他的必要测试, 在我们团队, Sentry 都是跟进社区 issue, 然后针对性的升级. 我们需要在测试环境验证所需的特性就位以后, 才执行升级
+* 测试结束, 拆除环境, 节约资源
+
+上方测试流程中, 用来发消息的小脚本, 也好心贴一下:
+
+```python
+#!/usr/bin/env python
+
+from datetime import datetime
+from os import environ
+from sys import argv
+
+import sentry_sdk
+
+if len(argv) > 1:
+    dsn = argv[1]
+else:
+    dsn = 'https://xxx@sentry.example.com/1'
+
+sentry_sdk.init(dsn)
+sentry_sdk.capture_message(str(datetime.now()))
+try:
+    1 / 0
+except:
+    sentry_sdk.capture_exception()
+```
+
+## 应用
+
+并不是搭建好就完事了, 如果仅仅是放养式地给大家随便用, 怕会出现一些不太好的实践. 我做的使用规范如下:
+
+* 平台对于 sentry 的定位, 是以次优先级别来运行的服务, 目的也只是兜底报警和辅助排查, 因此报错量暴涨的时候, sentry 一定会跪, 这也是预期行为. 不希望 sentry 的资源占用失控, 进而影响线上其他服务. 因此, 各位使用方务必注意, **不要依赖 sentry 作为唯一排查工具**, 要要成良好的打日志习惯, 出问题的时候总能看日志, 而不是 sentry 挂了就没法处理报错了
+* 原则上事件只留存 14d, 并且会有比较强硬的 rate-limit, sentry 涉及组件众多, 很害怕打爆拖累整个平台
+* 每个项目创建之初, 需要自己创建好 alert rules, 默认不发送告警消息
