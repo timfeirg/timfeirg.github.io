@@ -251,6 +251,13 @@ mysql_client.use('mydatabase')
 * 产生的数据报表, 或者别的 ad hoc 流程的产物, 都放在 jfs 上, 直接就能方便地分享给他人(见上方"网盘"一节)
 * 所有的代码(在 Jupyter 的世界里, 叫 notebook) 都存放在 jfs, 用 `juicefs snapshot` 来做定期备份
 
+## 妙用: GitLab, ClickHouse, Elasticsearch, etc.
+
+理论上, 所有应用需要数据落盘的时候, 你都可以放到 jfs 里, 只要合适的性能区间匹配就行. 在这一节里介绍一下我们探索过的一些用法:
+
+* GitLab 对磁盘 IO 的要求还是挺高的, 尤其 MR 的时候, 如果代码库很大, 最好还是视情况迁到 SSD. 但如果你是个小团队, 项目不多也不大, 那放在 jfs 上就能享受到一系列额外的好处, 比如用 `juicefs grep` 全局搜索代码仓库(找垃圾代码), 方便地用 `juicefs snapshot` 全量备份所有 repo data, 等等
+* 我用 ClickHouse 配合 JuiceFS CSI, 方便地拉起 CH 集群, 这点在 [小团队如何维护 Sentry](/2022/03/04/sentry.html) 有更详细介绍, 不重复
+
 ## 妙用: CI
 
 就以 GitLab CI 为例吧, 给 Runner 设置好挂载目录:
