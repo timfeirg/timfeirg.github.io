@@ -1,5 +1,5 @@
 name: timfeirg
-description: ""
+description: "low tech"
 meta_description: ""
 
 markdown: kramdown
@@ -11,6 +11,7 @@ domain_name: "http://timfeirg.github.io"
 google_analytics: "UA-112067081-1"
 plugins:
   - jekyll-paginate
+  - jekyll-feed
 
 # Details for the RSS feed generator
 url: ""
